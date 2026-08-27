@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Sense HAT <-> Home Assistant bridge.
+
+- Publishes temperature/humidity/pressure to HA via MQTT discovery.
+- Joystick controls all HA lights (see README):
+    click       -> toggle on/off
+    up / down   -> brightness +/-
+    left / right-> colour warm <-> blue
+- LED matrix shows a bar: height = brightness, colour = warm/blue setting.
+
+Configuration comes from environment variables, which the systemd unit loads
+from config.env. When run by hand, this script also reads ./config.env itself.
+"""
+
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+# --- load config.env when present (so the script works without systemd too) ---
+_CFG = Path(__file__).resolve().parent / "config.env"
+if _CFG.exists():
+    for _line in _CFG.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
+
+def _env(name, default):
+    return os.environ.get(name, default)
+
+
+# --- configuration knobs -----------------------------------------------------
+MQTT_HOST = _env("MQTT_HOST", "192.168.1.221")
+MQTT_PORT = int(_env("MQTT_PORT", "1883"))
+MQTT_USER = _env("MQTT_USER", "")
+MQTT_PASS = _env("MQTT_PASS", "")
+
+NODE_ID = _env("NODE_ID", "sensehat")           # unique id for this Pi
+DISCOVERY_PREFIX = _env("DISCOVERY_PREFIX", "homeassistant")
+CMD_TOPIC = _env("CMD_TOPIC", "sensehat/lights/set")  # lights command topic
+
+PUBLISH_INTERVAL = float(_env("PUBLISH_INTERVAL", "30"))   # seconds
+BRIGHTNESS_STEP = int(_env("BRIGHTNESS_STEP", "10"))       # % per joystick step
+WARMTH_STEP = int(_env("WARMTH_STEP", "12"))               # warm<->blue per step
+TEMP_OFFSET = float(_env("TEMP_OFFSET", "0"))   # calibrate temp (CPU heats Pi)
+LOW_LIGHT = _env("LOW_LIGHT", "true").lower() in ("1", "true", "yes")
+
+# Long-press the joystick (middle) to reveal the temp/humidity/pressure columns;
+# they auto-hide this many seconds later, back to the light-only view.
+STATS_REVEAL_SECONDS = float(_env("STATS_REVEAL_SECONDS", "8"))
+
+# Blank the LED matrix after this many seconds with no joystick activity; any
+# joystick move/press wakes it. 0 disables the timeout (always on).
+MATRIX_TIMEOUT = float(_env("MATRIX_TIMEOUT", "60"))
+
+# Auto-orientation from the accelerometer: rotate the grid AND remap the joystick
+# so it follows however the Pi is physically placed (0/90/180/270).
+AUTO_ORIENT = _env("AUTO_ORIENT", "true").lower() in ("1", "true", "yes")
+# Used when the Pi is lying flat (gravity straight down -> orientation unknown).
+DEFAULT_ROTATION = int(_env("DEFAULT_ROTATION", "180")) % 360
+# Added to the detected rotation, for calibrating if grid/joystick come out
+# turned 90/180 from what you expect. Must be a multiple of 90.
+ROTATION_OFFSET = int(_env("ROTATION_OFFSET", "0")) % 360
+
+# Colour endpoints for the warm<->blue slider (RGB). warmth 0 = WARM, 100 = BLUE.
+WARM_RGB = (255, 140, 40)
+BLUE_RGB = (60, 120, 255)
+
+# --- LED matrix dashboard: 4 columns x 2px wide -> light, temp, humidity, pressure.
+# Each stat column is a bar whose height maps its value between MIN..MAX.
+TEMP_MIN = float(_env("TEMP_MIN", "14"))
+TEMP_MAX = float(_env("TEMP_MAX", "30"))
+HUM_MIN = float(_env("HUM_MIN", "20"))
+HUM_MAX = float(_env("HUM_MAX", "80"))
+PRES_MIN = float(_env("PRES_MIN", "980"))
+PRES_MAX = float(_env("PRES_MAX", "1040"))
+# Fixed colours for the stat columns (the light column uses its warm/blue colour).
+# NOTE: the LED matrix is 5-bit/channel with a gamma curve that crushes anything
+# below ~level 6 to black/grey. With low_light on, these render dim but clearly
+# coloured: red (4,1,1), blue (1,1,4), green (1,4,1). They have to stay fairly
+# saturated (one strong channel) — pastel/muted dim colours collapse to grey.
+TEMP_RGB = (160, 18, 12)    # dim red
+HUM_RGB = (14, 16, 165)     # dim blue
+PRES_RGB = (14, 165, 28)    # dim green
+# Extra dimness for the stat columns (0..1). Keep at 1.0 — lowering it pushes
+# the colours under the gamma cliff and they turn grey. To brighten instead,
+# raise the strong channel in the colours above.
+STAT_BRIGHTNESS = float(_env("STAT_BRIGHTNESS", "1.0"))
+
+STATE_FILE = Path(__file__).resolve().parent / "state.json"
+
+from sense_hat import SenseHat  # noqa: E402
+import paho.mqtt.client as mqtt  # noqa: E402
+
+
+# --- light/display state -----------------------------------------------------
+state = {
+    "on": False,
+    "brightness": 60,   # 0-100 %
+    "warmth": 0,        # 0 = warm, 100 = blue
+}
+
+# Latest sensor readings, cached so the matrix can redraw without re-reading I2C.
+readings = {"temperature": None, "humidity": None, "pressure": None}
+
+# Runtime UI state.
+ui = {
+    "rotation": DEFAULT_ROTATION,  # current display rotation (0/90/180/270)
+    "stats_until": 0.0,            # monotonic time until which stat columns show
+    "middle_long": False,          # whether the current middle-press went long
+    "last_activity": 0.0,          # monotonic time of last joystick activity
+    "asleep": False,               # whether the matrix is blanked by the timeout
+}
+
+
+def read_sensors(sense):
+    readings["temperature"] = round(sense.get_temperature() - TEMP_OFFSET, 1)
+    readings["humidity"] = round(sense.get_humidity(), 1)
+    readings["pressure"] = round(sense.get_pressure(), 1)
+    return readings
+
+
+# --- orientation ------------------------------------------------------------
+# Joystick directions in clockwise order, used to remap raw events by rotation.
+_CW = ("up", "right", "down", "left")
+
+
+def rotate_dir(direction, deg):
+    """Map a raw joystick direction to its logical (upright) direction.
+
+    The joystick is read in the board frame; to express it in the upright
+    display frame we rotate by the inverse of the display rotation (-deg).
+    Verified against all four orientations via on-device calibration.
+    """
+    if direction not in _CW:
+        return direction
+    return _CW[(_CW.index(direction) - (deg // 90)) % 4]
+
+
+def detect_rotation(sense):
+    """Pick 0/90/180/270 from gravity, or None if flat/ambiguous (unknown)."""
+    a = sense.get_accelerometer_raw()
+    x, y = a["x"], a["y"]
+    # Need one in-plane axis clearly dominant, else we can't tell (flat or 45°).
+    # Signs below were calibrated to this board's accel vs grid/joystick "up".
+    if abs(y) >= abs(x) + 0.2 and abs(y) > 0.5:
+        return 180 if y < 0 else 0
+    if abs(x) >= abs(y) + 0.2 and abs(x) > 0.5:
+        return 90 if x < 0 else 270
+    return None
+
+
+def update_orientation(sense):
+    """Re-read orientation and apply it to the grid if it changed."""
+    base = detect_rotation(sense) if AUTO_ORIENT else DEFAULT_ROTATION
+    if base is None:
+        return  # unknown right now — keep whatever we last had
+    rot = (base + ROTATION_OFFSET) % 360
+    if rot != ui["rotation"]:
+        ui["rotation"] = rot
+        sense.set_rotation(rot)
+        if not ui["asleep"]:
+            render_matrix(sense)
+
+
+def load_state():
+    try:
+        state.update(json.loads(STATE_FILE.read_text()))
+    except Exception:
+        pass
+
+
+def save_state():
+    try:
+        STATE_FILE.write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def lerp(a, b, t):
+    return int(round(a + (b - a) * t))
+
+
+def current_rgb(scale=1.0):
+    """RGB for the current warmth, optionally dimmed by `scale` (0..1)."""
+    t = state["warmth"] / 100.0
+    r = lerp(WARM_RGB[0], BLUE_RGB[0], t)
+    g = lerp(WARM_RGB[1], BLUE_RGB[1], t)
+    b = lerp(WARM_RGB[2], BLUE_RGB[2], t)
+    return (int(r * scale), int(g * scale), int(b * scale))
+
+
+# --- MQTT --------------------------------------------------------------------
+DEVICE = {
+    "identifiers": [f"{NODE_ID}_pi"],
+    "name": "Sense HAT (Raspberry Pi)",
+    "manufacturer": "Raspberry Pi",
+    "model": "Sense HAT",
+}
+
+SENSORS = {
+    "temperature": {"name": "Sense HAT Temperature", "unit": "°C",
+                    "dev_cls": "temperature", "icon": "mdi:thermometer"},
+    "humidity": {"name": "Sense HAT Humidity", "unit": "%",
+                 "dev_cls": "humidity", "icon": "mdi:water-percent"},
+    "pressure": {"name": "Sense HAT Pressure", "unit": "hPa",
+                 "dev_cls": "pressure", "icon": "mdi:gauge"},
+}
+
+STATE_TOPIC = f"{NODE_ID}/sensors/state"
+
+
+def publish_discovery(client):
+    for key, meta in SENSORS.items():
+        topic = f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/{key}/config"
+        payload = {
+            "name": meta["name"],
+            "unique_id": f"{NODE_ID}_{key}",
+            "state_topic": STATE_TOPIC,
+            "value_template": f"{{{{ value_json.{key} }}}}",
+            "unit_of_measurement": meta["unit"],
+            "device_class": meta["dev_cls"],
+            "state_class": "measurement",
+            "icon": meta["icon"],
+            "device": DEVICE,
+        }
+        client.publish(topic, json.dumps(payload), retain=True)
+
+
+def publish_sensors(client, sense):
+    data = read_sensors(sense)
+    client.publish(STATE_TOPIC, json.dumps(data), retain=True)
+
+
+def publish_light_command(client):
+    if state["on"]:
+        payload = {
+            "state": "on",
+            "brightness_pct": state["brightness"],
+            "rgb": list(current_rgb()),
+        }
+    else:
+        payload = {"state": "off"}
+    client.publish(CMD_TOPIC, json.dumps(payload), retain=True)
+
+
+# --- LED matrix --------------------------------------------------------------
+def _value_rows(value, lo, hi):
+    """Map a value within lo..hi to 0..8 LED rows."""
+    if value is None:
+        return 0
+    t = (value - lo) / (hi - lo) if hi > lo else 0
+    return max(0, min(8, round(t * 8)))
+
+
+def _dim(rgb, f):
+    return (int(rgb[0] * f), int(rgb[1] * f), int(rgb[2] * f))
+
+
+def _fill_column(pixels, x0, width, rows, rgb):
+    """Fill a `width`-px column starting at x0 with `rows` lit from the bottom.
+
+    Drawn upright (bar grows from the bottom row up); orientation is handled
+    separately by sense.set_rotation().
+    """
+    for y in range(8):
+        on = y >= (8 - rows)
+        colour = rgb if on else (0, 0, 0)
+        for dx in range(width):
+            pixels[y * 8 + x0 + dx] = colour
+
+
+def stats_visible():
+    return time.monotonic() < ui["stats_until"]
+
+
+def render_matrix(sense):
+    """Light-only across the whole grid, or 4 columns when stats are revealed."""
+    pixels = [(0, 0, 0)] * 64
+    if not stats_visible():
+        # Light only: a full-width bar — height = brightness, colour = warm/blue.
+        if state["on"]:
+            light_rows = max(1, round(state["brightness"] / 100 * 8))
+            _fill_column(pixels, 0, 8, light_rows, current_rgb())
+        sense.set_pixels(pixels)
+        return
+    # Revealed dashboard: light | temp | humidity | pressure (2px columns each).
+    if state["on"]:
+        light_rows = max(1, round(state["brightness"] / 100 * 8))
+        _fill_column(pixels, 0, 2, light_rows, current_rgb())
+    _fill_column(pixels, 2, 2, _value_rows(readings["temperature"], TEMP_MIN, TEMP_MAX),
+                 _dim(TEMP_RGB, STAT_BRIGHTNESS))
+    _fill_column(pixels, 4, 2, _value_rows(readings["humidity"], HUM_MIN, HUM_MAX),
+                 _dim(HUM_RGB, STAT_BRIGHTNESS))
+    _fill_column(pixels, 6, 2, _value_rows(readings["pressure"], PRES_MIN, PRES_MAX),
+                 _dim(PRES_RGB, STAT_BRIGHTNESS))
+    sense.set_pixels(pixels)
+
+
+# --- joystick actions --------------------------------------------------------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def apply_direction(logical, client, sense):
+    """Act on a rotation-corrected direction (up=brighter, left=warmer, etc.)."""
+    if logical == "up":
+        state["on"] = True
+        state["brightness"] = clamp(state["brightness"] + BRIGHTNESS_STEP, 5, 100)
+    elif logical == "down":
+        state["brightness"] = clamp(state["brightness"] - BRIGHTNESS_STEP, 5, 100)
+    elif logical == "left":
+        state["warmth"] = clamp(state["warmth"] - WARMTH_STEP, 0, 100)   # warmer
+    elif logical == "right":
+        state["warmth"] = clamp(state["warmth"] + WARMTH_STEP, 0, 100)   # bluer
+    else:
+        return
+    render_matrix(sense)
+    publish_light_command(client)
+    save_state()
+
+
+def handle_event(event, client, sense):
+    """Dispatch a stick event. Middle = toggle (short) or reveal stats (long)."""
+    # Any activity wakes the matrix; the waking input only wakes (no action), so
+    # you don't accidentally toggle the lights when rousing the display.
+    ui["last_activity"] = time.monotonic()
+    if ui["asleep"]:
+        ui["asleep"] = False
+        ui["middle_long"] = True   # swallow the rest of this press (no toggle)
+        render_matrix(sense)
+        return
+
+    if event.direction == "middle":
+        if event.action == "pressed":
+            ui["middle_long"] = False
+        elif event.action == "held" and not ui["middle_long"]:
+            ui["middle_long"] = True            # long press -> reveal stats
+            ui["stats_until"] = time.monotonic() + STATS_REVEAL_SECONDS
+            render_matrix(sense)
+        elif event.action == "released" and not ui["middle_long"]:
+            state["on"] = not state["on"]       # short press -> toggle lights
+            render_matrix(sense)
+            publish_light_command(client)
+            save_state()
+        return
+    # Directional events: act on press and while held (so holding ramps).
+    if event.action in ("pressed", "held"):
+        apply_direction(rotate_dir(event.direction, ui["rotation"]), client, sense)
+
+
+# --- lifecycle ---------------------------------------------------------------
+_running = True
+
+
+def _stop(*_):
+    global _running
+    _running = False
+
+
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    print(f"MQTT connected: {reason_code}", flush=True)
+    publish_discovery(client)
+
+
+def main():
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    load_state()
+
+    sense = SenseHat()
+    sense.low_light = LOW_LIGHT
+    sense.set_rotation(ui["rotation"])
+    read_sensors(sense)      # populate stat columns before first draw
+    update_orientation(sense)
+    render_matrix(sense)
+    ui["last_activity"] = time.monotonic()
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=NODE_ID)
+    if MQTT_USER:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+    client.on_connect = on_connect
+    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.loop_start()
+
+    last_publish = 0.0
+    last_orient = 0.0
+    stats_were_visible = False
+    try:
+        while _running:
+            for event in sense.stick.get_events():
+                handle_event(event, client, sense)
+            now = time.monotonic()
+            # Blank the matrix after the inactivity timeout (0 = never).
+            if (MATRIX_TIMEOUT > 0 and not ui["asleep"]
+                    and now - ui["last_activity"] >= MATRIX_TIMEOUT):
+                ui["asleep"] = True
+                sense.clear()
+            # Re-check physical orientation a couple of times a second.
+            if now - last_orient >= 0.4:
+                update_orientation(sense)
+                last_orient = now
+            # Redraw once when the long-press stats reveal expires.
+            vis = stats_visible()
+            if stats_were_visible and not vis and not ui["asleep"]:
+                render_matrix(sense)
+            stats_were_visible = vis
+            if now - last_publish >= PUBLISH_INTERVAL:
+                publish_sensors(client, sense)
+                if not ui["asleep"]:
+                    render_matrix(sense)   # refresh with new readings
+                last_publish = now
+            time.sleep(0.05)
+    finally:
+        save_state()
+        sense.clear()
+        client.loop_stop()
+        client.disconnect()
+        print("stopped", flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

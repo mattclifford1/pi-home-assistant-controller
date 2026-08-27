@@ -1,0 +1,62 @@
+# Home Assistant automation: Sense HAT joystick -> bedroom lights + blinds.
+#
+# How to add it:
+#   Settings -> Automations & Scenes -> Automations -> Create Automation
+#   -> (three-dot menu, top right) -> "Edit in YAML" -> paste this -> Save.
+#
+# Replaces the older "Sense HAT joystick lights" automation — delete that one.
+#
+# The Pi publishes plain-text commands when the joystick is used:
+#   sensehat/bedroom/lights/set  -> "toggle"
+#   sensehat/bedroom/blinds/set  -> "open" | "close"
+#
+# TARGETING: this uses the "bedroom" area, so it hits every light / cover in
+# that HA area. If your area is named differently, or you want specific
+# entities, replace each `area_id: bedroom` with e.g.
+#   entity_id: light.bedroom_ceiling
+# (Check names under Settings -> Areas, or Developer Tools -> States.)
+
+alias: Sense HAT bedroom controls
+description: Joystick click toggles bedroom lights; up/down opens/closes blinds.
+mode: queued
+max: 10
+triggers:
+  - trigger: mqtt
+    topic: sensehat/bedroom/lights/set
+    id: lights
+  - trigger: mqtt
+    topic: sensehat/bedroom/blinds/set
+    id: blinds
+conditions: []
+actions:
+  - choose:
+      # --- click -> toggle the bedroom lights ---
+      - conditions:
+          - condition: trigger
+            id: lights
+        sequence:
+          - action: light.toggle
+            target:
+              area_id: bedroom
+
+      # --- up -> open the blinds ---
+      - conditions:
+          - condition: trigger
+            id: blinds
+          - condition: template
+            value_template: "{{ trigger.payload == 'open' }}"
+        sequence:
+          - action: cover.open_cover
+            target:
+              area_id: bedroom
+
+      # --- down -> close the blinds ---
+      - conditions:
+          - condition: trigger
+            id: blinds
+          - condition: template
+            value_template: "{{ trigger.payload == 'close' }}"
+        sequence:
+          - action: cover.close_cover
+            target:
+              area_id: bedroom
