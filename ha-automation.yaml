@@ -10,11 +10,13 @@
 #   sensehat/bedroom/lights/set  -> "toggle"
 #   sensehat/bedroom/blinds/set  -> "open" | "close"
 #
-# TARGETING: this uses the "bedroom" area, so it hits every light / cover in
-# that HA area. If your area is named differently, or you want specific
-# entities, replace each `area_id: bedroom` with e.g.
-#   entity_id: light.bedroom_ceiling
-# (Check names under Settings -> Areas, or Developer Tools -> States.)
+# TARGETING:
+#   lights -> the "Bedroom" area (area_id: bedroom), i.e. every light in it.
+#   blinds -> the "Bedroom Blinds" cover entity (cover.bedroom_blinds).
+#
+# Verify the blinds entity id: Developer Tools -> States, filter on "cover.".
+# If it differs, change the two entity_id lines below to match. To target every
+# cover in the Bedroom area instead, swap the entity_id for `area_id: bedroom`.
 
 alias: Sense HAT bedroom controls
 description: Joystick click toggles bedroom lights; up/down opens/closes blinds.
@@ -48,7 +50,7 @@ actions:
         sequence:
           - action: cover.open_cover
             target:
-              area_id: bedroom
+              entity_id: cover.bedroom_blinds
 
       # --- down -> close the blinds ---
       - conditions:
@@ -59,4 +61,4 @@ actions:
         sequence:
           - action: cover.close_cover
             target:
-              area_id: bedroom
+              entity_id: cover.bedroom_blinds

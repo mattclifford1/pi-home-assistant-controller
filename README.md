@@ -146,5 +146,5 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
 - [x] Stripped back to: matrix off, click = bedroom lights, up/down = blinds
 - [ ] Updated `ha-automation.yaml` pasted into HA (replaces the old
       "Sense HAT joystick lights" automation — delete that one)
-- [ ] Confirm the HA **`bedroom` area** name / entities match your setup
+- [x] Targets confirmed: "Bedroom" area + cover.bedroom_blinds
 - [ ] Temperature offset sanity-checked (`TEMP_OFFSET=17`)
