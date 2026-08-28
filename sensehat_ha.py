@@ -5,8 +5,8 @@ Two input sources, either or both may be present:
 
   USB volume knob        Sense HAT joystick
   ---------------        ------------------
-  volume up   -> blinds open      up    -> blinds open
-  volume down -> blinds close     down  -> blinds close
+  volume up   -> blinds close     up    -> blinds open
+  volume down -> blinds open      down  -> blinds close
   mute press  -> lights toggle    click -> lights toggle
 
 Also publishes the Sense HAT's temperature/humidity/pressure to HA via MQTT
@@ -125,8 +125,8 @@ KEY_VOLUMEUP = 115
 
 # Knob key -> action. Edit here to remap the knob.
 KNOB_MAP = {
-    KEY_VOLUMEUP: "blinds_open",
-    KEY_VOLUMEDOWN: "blinds_close",
+    KEY_VOLUMEUP: "blinds_close",
+    KEY_VOLUMEDOWN: "blinds_open",
     KEY_MUTE: "lights_toggle",
 }
 

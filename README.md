@@ -8,9 +8,12 @@ you swap hardware — no code or config change needed.
 
 | Action                | USB volume knob | Sense HAT joystick |
 |-----------------------|-----------------|--------------------|
-| Open the blinds       | volume up       | up                 |
-| Close the blinds      | volume down     | down               |
+| Open the blinds       | volume **down** | up                 |
+| Close the blinds      | volume **up**   | down               |
 | Toggle bedroom lights | mute press      | click              |
+
+The knob's up/down is deliberately the opposite way round to the joystick's —
+turning the knob "up" winds the blinds *down*.
 
 - **Currently fitted:** the USB volume knob (the Sense HAT is off the board).
 - **Sensors** (temperature, humidity, pressure) publish to HA via MQTT discovery
@@ -190,7 +193,7 @@ Done:
 
 Outstanding:
 
-- [ ] End-to-end test: press mute (lights) and turn the knob (blinds).
+- [x] End-to-end test — knob confirmed working
 - [ ] Check how the live HA automation targets the blinds. It was pasted around
       the same time the blinds were identified as "Bedroom Blinds", so it may
       use `area_id: bedroom` (the earlier version) rather than
