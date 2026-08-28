@@ -1,23 +1,31 @@
-# Sense HAT → Home Assistant
+# Bedroom controls → Home Assistant
 
-Bridges the Raspberry Pi 3 Sense HAT to Home Assistant over MQTT.
+Bridges physical controls on a Raspberry Pi 3 to Home Assistant over MQTT.
 
-- **Sensors** (temperature, humidity, pressure) are published to HA via MQTT
-  discovery, so they appear automatically as `sensor.*` entities.
-- **Joystick** controls the bedroom (directions are auto-corrected for however
-  the Pi is physically oriented — see "Joystick orientation"):
-  - **Click** → toggle the bedroom lights
-  - **Up** → open the bedroom blinds
-  - **Down** → close the bedroom blinds
-  - **Left / Right** → unused for now
-- **LED matrix** is **off**. (It previously showed a light/sensor bar dashboard;
-  that code is kept in git history and in `sensehat_ha.py.matrix-version.bak`
-  if you ever want it back.)
+Two input devices are supported, **either or both**. Whichever is plugged in is
+used; the service starts fine with one missing and picks it up automatically if
+you swap hardware — no code or config change needed.
+
+| Action                | USB volume knob | Sense HAT joystick |
+|-----------------------|-----------------|--------------------|
+| Open the blinds       | volume up       | up                 |
+| Close the blinds      | volume down     | down               |
+| Toggle bedroom lights | mute press      | click              |
+
+- **Currently fitted:** the USB volume knob (the Sense HAT is off the board).
+- **Sensors** (temperature, humidity, pressure) publish to HA via MQTT discovery
+  — only while the Sense HAT is attached.
+- **LED matrix** stays off. The old matrix dashboard is kept in git history and
+  in `sensehat_ha.py.matrix-version.bak`.
 
 ## Hardware / host facts (this machine)
 
-- Raspberry Pi 3 Model B Rev 1.2, Sense HAT attached (**v1** — no light/colour
-  sensor; the only other onboard sensors are the IMU: accel/gyro/magnetometer).
+- Raspberry Pi 3 Model B Rev 1.2.
+- **USB volume knob**: `ZhenHuiDesignTechnology USB-AUDIO SYSTEM`, currently
+  `/dev/input/event2`. Emits `KEY_VOLUMEUP` (115), `KEY_VOLUMEDOWN` (114),
+  `KEY_MUTE` (113). Auto-detected by name, so the event number can change.
+- **Sense HAT** (**v1** — no light/colour sensor; other onboard sensors are the
+  IMU: accel/gyro/magnetometer). Currently **detached**.
 - Pi IP: `192.168.1.64`
 - Home Assistant: `http://192.168.1.221:8123`
 - MQTT broker: Mosquitto add-on on the HA box, `192.168.1.221:1883`,
@@ -81,8 +89,8 @@ You want `MQTT connected: Success`. Then add the HA automation from
 
 ## How it works (for future tweaking)
 
-- `sensehat_ha.py` — the service. Reads sensors, handles joystick events, and
-  talks MQTT.
+- `sensehat_ha.py` — the service. Reads the knob and/or Sense HAT, publishes
+  sensors, and talks MQTT.
 - `config.env` — broker credentials, command topics, and tuning knobs. Edit,
   then `sudo systemctl restart sensehat-ha`.
 - `sensehat-ha.service` — systemd unit (autostart + restart on failure).
@@ -100,7 +108,24 @@ You want `MQTT connected: Success`. Then add the HA automation from
 Commands are published **non-retained** — they're one-shot actions, so HA won't
 replay the last one on restart.
 
-### Joystick orientation (auto)
+### USB volume knob
+
+Read straight from `/dev/input/eventN` by parsing `input_event` structs — no
+`evdev` package needed, so there is nothing extra to install. The user `matt` is
+in the `input` group, which is what grants read access.
+
+- **Auto-detected** by matching `KNOB_NAME_MATCH` (default `USB-AUDIO`) against
+  `/proc/bus/input/devices`, so the `eventN` number changing across reboots or
+  re-plugs doesn't matter. Pin a device with `KNOB_DEVICE` if you ever need to.
+- **Hot-plug tolerant**: if the knob is missing at startup, or unplugged while
+  running, the service keeps going and retries every ~5s.
+- Only **key presses** act (releases and autorepeats are ignored), and repeats
+  inside `ACTION_DEBOUNCE` are dropped — so spinning the knob several detents
+  sends a single "open"/"close" rather than a burst.
+- **Remap** the knob by editing `KNOB_MAP` in `sensehat_ha.py`. The device also
+  reports play/pause and next/prev track keys, which are unused.
+
+### Joystick orientation (Sense HAT, auto)
 
 The joystick auto-orients from the accelerometer, so directions stay physically
 correct however the Pi is placed (0/90/180/270):
@@ -124,7 +149,10 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
 - **Target different lights/blinds:** edit `ha-automation.yaml` — it targets the
   HA **`bedroom` area**; swap `area_id: bedroom` for explicit `entity_id:`s if
   you prefer. Reload automations in HA afterwards.
-- **View logs:** `journalctl -u sensehat-ha -f` (joystick actions are logged).
+- **Remap the knob:** edit `KNOB_MAP` in `sensehat_ha.py`; the joystick is
+  `STICK_MAP` just below it.
+- **View logs:** `journalctl -u sensehat-ha -f` (every action is logged as
+  `action: blinds_open` etc, so you can tell Pi-side from HA-side problems).
 - **Stop / start:** `sudo systemctl stop|start sensehat-ha`
 
 ### Gotchas learned the hard way
@@ -141,10 +169,10 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
 
 - [x] MQTT broker set up in HA (Mosquitto add-on, login `pi_sensehat`)
 - [x] I2C enabled + packages installed + service running on boot
-- [x] Sensors publishing to HA via MQTT discovery
 - [x] Joystick orientation calibrated across all four orientations
-- [x] Stripped back to: matrix off, click = bedroom lights, up/down = blinds
+- [x] USB volume knob supported (auto-detected, debounced, hot-plug tolerant)
+- [x] Sense HAT made optional — refit it and it is picked up automatically
+- [x] Targets confirmed: "Bedroom" area + `cover.bedroom_blinds`
 - [ ] Updated `ha-automation.yaml` pasted into HA (replaces the old
       "Sense HAT joystick lights" automation — delete that one)
-- [x] Targets confirmed: "Bedroom" area + cover.bedroom_blinds
-- [ ] Temperature offset sanity-checked (`TEMP_OFFSET=17`)
+- [ ] Knob tested end-to-end against HA

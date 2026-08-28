@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Sense HAT <-> Home Assistant bridge.
+"""Bedroom controls -> Home Assistant bridge.
 
-- Publishes temperature/humidity/pressure to HA via MQTT discovery.
-- Joystick (bedroom controls):
-    click     -> toggle the bedroom lights
-    up        -> open the bedroom blinds
-    down      -> close the bedroom blinds
-    left/right-> unused
-- LED matrix is kept OFF.
+Two input sources, either or both may be present:
 
-Joystick directions are auto-corrected for however the Pi is physically
-oriented, using the accelerometer (see rotate_dir / detect_rotation).
+  USB volume knob        Sense HAT joystick
+  ---------------        ------------------
+  volume up   -> blinds open      up    -> blinds open
+  volume down -> blinds close     down  -> blinds close
+  mute press  -> lights toggle    click -> lights toggle
+
+Also publishes the Sense HAT's temperature/humidity/pressure to HA via MQTT
+discovery, when the HAT is attached.
+
+Both input devices are optional and hot-pluggable: whichever is present is
+used, and the service keeps running (and retries) if one is missing. So the
+Sense HAT can be swapped back on at any time without touching this code.
 
 Configuration comes from environment variables, which the systemd unit loads
 from config.env. When run by hand, this script also reads ./config.env itself.
@@ -18,7 +22,10 @@ from config.env. When run by hand, this script also reads ./config.env itself.
 
 import json
 import os
+import re
+import select
 import signal
+import struct
 import sys
 import time
 from pathlib import Path
@@ -38,6 +45,10 @@ def _env(name, default):
     return os.environ.get(name, default)
 
 
+def _flag(name, default):
+    return _env(name, default).lower() in ("1", "true", "yes")
+
+
 # --- configuration knobs -----------------------------------------------------
 MQTT_HOST = _env("MQTT_HOST", "192.168.1.221")
 MQTT_PORT = int(_env("MQTT_PORT", "1883"))
@@ -54,24 +65,183 @@ BLINDS_TOPIC = _env("BLINDS_TOPIC", "sensehat/bedroom/blinds/set")
 PUBLISH_INTERVAL = float(_env("PUBLISH_INTERVAL", "30"))   # seconds
 TEMP_OFFSET = float(_env("TEMP_OFFSET", "0"))   # calibrate temp (CPU heats Pi)
 
-# Auto-orientation from the accelerometer: works out how the Pi is placed
-# (0/90/180/270) so the joystick directions stay physically correct.
-AUTO_ORIENT = _env("AUTO_ORIENT", "true").lower() in ("1", "true", "yes")
+# Minimum gap between repeated commands. Spinning the knob emits one event per
+# detent; the blinds only need telling once, so extra events inside this window
+# are dropped instead of spamming Home Assistant.
+ACTION_DEBOUNCE = float(_env("ACTION_DEBOUNCE", "0.4"))
+
+# --- USB volume knob ---
+ENABLE_KNOB = _flag("ENABLE_KNOB", "true")
+# Explicit input device path; leave blank to auto-detect by name.
+KNOB_DEVICE = _env("KNOB_DEVICE", "")
+# Substring matched against device names in /proc/bus/input/devices.
+KNOB_NAME_MATCH = _env("KNOB_NAME_MATCH", "USB-AUDIO")
+
+# --- Sense HAT (optional; absent while the knob is fitted instead) ---
+ENABLE_SENSEHAT = _flag("ENABLE_SENSEHAT", "true")
+# Auto-orientation from the accelerometer, so joystick directions stay
+# physically correct however the Pi is placed (0/90/180/270).
+AUTO_ORIENT = _flag("AUTO_ORIENT", "true")
 # Used when the Pi is lying flat (gravity straight down -> orientation unknown).
 DEFAULT_ROTATION = int(_env("DEFAULT_ROTATION", "180")) % 360
 # Added to the detected rotation, for calibrating if directions come out
 # turned 90/180 from what you expect. Must be a multiple of 90.
 ROTATION_OFFSET = int(_env("ROTATION_OFFSET", "0")) % 360
 
-from sense_hat import SenseHat  # noqa: E402
 import paho.mqtt.client as mqtt  # noqa: E402
 
 
-# --- runtime state -----------------------------------------------------------
-# Latest sensor readings.
-readings = {"temperature": None, "humidity": None, "pressure": None}
+# --- actions -----------------------------------------------------------------
+# Commands are published non-retained: they are one-shot actions, so HA must
+# not replay them on restart.
+_last_action = {}
 
+
+def do_action(name, client):
+    """Publish one command, debounced per action."""
+    now = time.monotonic()
+    if now - _last_action.get(name, 0.0) < ACTION_DEBOUNCE:
+        return
+    _last_action[name] = now
+    if name == "lights_toggle":
+        client.publish(LIGHTS_TOPIC, "toggle", retain=False)
+    elif name == "blinds_open":
+        client.publish(BLINDS_TOPIC, "open", retain=False)
+    elif name == "blinds_close":
+        client.publish(BLINDS_TOPIC, "close", retain=False)
+    else:
+        return
+    print(f"action: {name}", flush=True)
+
+
+# --- USB volume knob ---------------------------------------------------------
+# struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
+_EV_FORMAT = "@llHHi"
+_EV_SIZE = struct.calcsize(_EV_FORMAT)
+_EV_KEY = 0x01
+KEY_MUTE = 113
+KEY_VOLUMEDOWN = 114
+KEY_VOLUMEUP = 115
+
+# Knob key -> action. Edit here to remap the knob.
+KNOB_MAP = {
+    KEY_VOLUMEUP: "blinds_open",
+    KEY_VOLUMEDOWN: "blinds_close",
+    KEY_MUTE: "lights_toggle",
+}
+
+
+def find_knob():
+    """Locate the knob's /dev/input/eventN, or None if it isn't plugged in."""
+    if KNOB_DEVICE:
+        return KNOB_DEVICE if os.path.exists(KNOB_DEVICE) else None
+    try:
+        blocks = Path("/proc/bus/input/devices").read_text().split("\n\n")
+    except OSError:
+        return None
+    for block in blocks:
+        name = re.search(r'N: Name="([^"]*)"', block)
+        if not name or KNOB_NAME_MATCH.lower() not in name.group(1).lower():
+            continue
+        handlers = re.search(r"H: Handlers=(.*)", block)
+        if not handlers:
+            continue
+        for token in handlers.group(1).split():
+            if token.startswith("event"):
+                path = f"/dev/input/{token}"
+                if os.path.exists(path):
+                    return path
+    return None
+
+
+class Knob:
+    """Reads key events straight from the input device (no evdev dependency)."""
+
+    def __init__(self):
+        self.fd = None
+        self.path = None
+        self.next_retry = 0.0
+
+    def ensure_open(self):
+        if self.fd is not None or not ENABLE_KNOB:
+            return
+        now = time.monotonic()
+        if now < self.next_retry:
+            return
+        self.next_retry = now + 5.0
+        path = find_knob()
+        if not path:
+            return
+        try:
+            self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            self.path = path
+            print(f"knob: using {path}", flush=True)
+        except OSError as exc:
+            print(f"knob: cannot open {path}: {exc}", flush=True)
+            self.fd = None
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self.path = None
+
+    def poll(self, client):
+        """Dispatch any pending key presses."""
+        self.ensure_open()
+        if self.fd is None:
+            return
+        try:
+            readable, _, _ = select.select([self.fd], [], [], 0)
+            if not readable:
+                return
+            data = os.read(self.fd, _EV_SIZE * 64)
+        except OSError:
+            print("knob: disconnected", flush=True)
+            self.close()
+            self.next_retry = time.monotonic() + 2.0
+            return
+        for offset in range(0, len(data) - _EV_SIZE + 1, _EV_SIZE):
+            _, _, etype, code, value = struct.unpack_from(
+                _EV_FORMAT, data, offset)
+            # value 1 = press, 2 = autorepeat, 0 = release. A detent of the
+            # knob is a press+release pair; act on the press only.
+            if etype == _EV_KEY and value == 1 and code in KNOB_MAP:
+                do_action(KNOB_MAP[code], client)
+
+
+# --- Sense HAT ---------------------------------------------------------------
+readings = {"temperature": None, "humidity": None, "pressure": None}
 ui = {"rotation": DEFAULT_ROTATION}   # current physical rotation (0/90/180/270)
+
+# Joystick directions in clockwise order, used to remap raw events by rotation.
+_CW = ("up", "right", "down", "left")
+
+# Joystick direction -> action.
+STICK_MAP = {
+    "up": "blinds_open",
+    "down": "blinds_close",
+    "middle": "lights_toggle",
+}
+
+
+def open_sensehat():
+    """Return a SenseHat, or None when the HAT isn't fitted."""
+    if not ENABLE_SENSEHAT:
+        return None
+    try:
+        from sense_hat import SenseHat
+        sense = SenseHat()
+        sense.clear()          # LED matrix stays off
+        print("sense hat: detected", flush=True)
+        return sense
+    except Exception as exc:
+        print(f"sense hat: not available ({exc.__class__.__name__}) — "
+              "running without it", flush=True)
+        return None
 
 
 def read_sensors(sense):
@@ -79,11 +249,6 @@ def read_sensors(sense):
     readings["humidity"] = round(sense.get_humidity(), 1)
     readings["pressure"] = round(sense.get_pressure(), 1)
     return readings
-
-
-# --- orientation ------------------------------------------------------------
-# Joystick directions in clockwise order, used to remap raw events by rotation.
-_CW = ("up", "right", "down", "left")
 
 
 def rotate_dir(direction, deg):
@@ -117,6 +282,18 @@ def update_orientation(sense):
     if base is None:
         return  # unknown right now — keep whatever we last had
     ui["rotation"] = (base + ROTATION_OFFSET) % 360
+
+
+def handle_stick(event, client):
+    """Act once per press (not while held, so blinds aren't spammed)."""
+    if event.action != "pressed":
+        return
+    direction = event.direction
+    if direction != "middle":
+        direction = rotate_dir(direction, ui["rotation"])
+    action = STICK_MAP.get(direction)
+    if action:
+        do_action(action, client)
 
 
 # --- MQTT --------------------------------------------------------------------
@@ -161,35 +338,6 @@ def publish_sensors(client, sense):
     client.publish(STATE_TOPIC, json.dumps(data), retain=True)
 
 
-# --- joystick actions --------------------------------------------------------
-def apply_direction(logical, client):
-    """Act on a rotation-corrected direction.
-
-    Commands are published non-retained: they are one-shot actions, so HA must
-    not replay them on restart.
-    """
-    if logical == "middle":
-        client.publish(LIGHTS_TOPIC, "toggle", retain=False)
-        print("bedroom lights: toggle", flush=True)
-    elif logical == "up":
-        client.publish(BLINDS_TOPIC, "open", retain=False)
-        print("bedroom blinds: open", flush=True)
-    elif logical == "down":
-        client.publish(BLINDS_TOPIC, "close", retain=False)
-        print("bedroom blinds: close", flush=True)
-    # left/right: unused for now
-
-
-def handle_event(event, client):
-    """Act once per press (not while held, so blinds aren't spammed)."""
-    if event.action != "pressed":
-        return
-    if event.direction == "middle":
-        apply_direction("middle", client)
-        return
-    apply_direction(rotate_dir(event.direction, ui["rotation"]), client)
-
-
 # --- lifecycle ---------------------------------------------------------------
 _running = True
 
@@ -208,10 +356,18 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    sense = SenseHat()
-    sense.clear()              # LED matrix stays off
-    read_sensors(sense)
-    update_orientation(sense)
+    sense = open_sensehat()
+    if sense:
+        read_sensors(sense)
+        update_orientation(sense)
+
+    knob = Knob()
+    knob.ensure_open()
+    if knob.fd is None and ENABLE_KNOB:
+        print("knob: not found yet — will keep looking", flush=True)
+    if sense is None and knob.fd is None:
+        print("warning: no input device present (no Sense HAT, no knob)",
+              flush=True)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=NODE_ID)
     if MQTT_USER:
@@ -224,19 +380,24 @@ def main():
     last_orient = 0.0
     try:
         while _running:
-            for event in sense.stick.get_events():
-                handle_event(event, client)
+            knob.poll(client)
+            if sense:
+                for event in sense.stick.get_events():
+                    handle_stick(event, client)
             now = time.monotonic()
-            # Re-check physical orientation a couple of times a second.
-            if now - last_orient >= 0.4:
-                update_orientation(sense)
-                last_orient = now
-            if now - last_publish >= PUBLISH_INTERVAL:
-                publish_sensors(client, sense)
-                last_publish = now
-            time.sleep(0.05)
+            if sense:
+                # Re-check physical orientation a couple of times a second.
+                if now - last_orient >= 0.4:
+                    update_orientation(sense)
+                    last_orient = now
+                if now - last_publish >= PUBLISH_INTERVAL:
+                    publish_sensors(client, sense)
+                    last_publish = now
+            time.sleep(0.02)
     finally:
-        sense.clear()
+        knob.close()
+        if sense:
+            sense.clear()
         client.loop_stop()
         client.disconnect()
         print("stopped", flush=True)
