@@ -185,15 +185,19 @@ Done:
 - [x] USB volume knob supported (auto-detected, debounced, hot-plug tolerant)
 - [x] Sense HAT made optional — refit it and it is picked up automatically
 - [x] Targets confirmed: "Bedroom" area + `cover.bedroom_blinds`
+- [x] **HA automation pasted in** — done at the bedroom retarget (confirmed).
+      The knob needed no HA change; it publishes the same topics.
 
 Outstanding:
 
-- [ ] **In HA:** make sure the automation from `ha-automation.yaml` is the live
-      one, and the older "Sense HAT joystick lights" automation is deleted.
-      This is left over from the bedroom retarget — *not* from the knob swap;
-      the knob needs no HA change. If the bedroom automation is already pasted
-      in, there is nothing to do here.
 - [ ] End-to-end test: press mute (lights) and turn the knob (blinds).
+- [ ] Check how the live HA automation targets the blinds. It was pasted around
+      the same time the blinds were identified as "Bedroom Blinds", so it may
+      use `area_id: bedroom` (the earlier version) rather than
+      `entity_id: cover.bedroom_blinds` (this repo's version). Both work **if**
+      the blinds are assigned to the Bedroom area; only the entity version works
+      if they are not. If the blinds don't respond, this is the first thing to
+      check.
 
 ### Testing end to end
 
