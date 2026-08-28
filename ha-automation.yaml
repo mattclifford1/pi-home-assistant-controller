@@ -1,4 +1,4 @@
-# Home Assistant automation: Sense HAT joystick -> bedroom lights + blinds.
+# Home Assistant automation: bedroom lights + blinds, driven by the Pi.
 #
 # How to add it:
 #   Settings -> Automations & Scenes -> Automations -> Create Automation
@@ -6,7 +6,11 @@
 #
 # Replaces the older "Sense HAT joystick lights" automation — delete that one.
 #
-# The Pi publishes plain-text commands when the joystick is used:
+# This one automation serves BOTH input devices — the USB volume knob and the
+# Sense HAT joystick publish the same commands, so swapping the hardware needs
+# no change here.
+#
+# The Pi publishes plain-text commands when a control is used:
 #   sensehat/bedroom/lights/set  -> "toggle"
 #   sensehat/bedroom/blinds/set  -> "open" | "close"
 #
@@ -18,8 +22,8 @@
 # If it differs, change the two entity_id lines below to match. To target every
 # cover in the Bedroom area instead, swap the entity_id for `area_id: bedroom`.
 
-alias: Sense HAT bedroom controls
-description: Joystick click toggles bedroom lights; up/down opens/closes blinds.
+alias: Bedroom controls (Pi)
+description: Knob/joystick toggles bedroom lights and opens/closes the blinds.
 mode: queued
 max: 10
 triggers:

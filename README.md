@@ -108,6 +108,16 @@ You want `MQTT connected: Success`. Then add the HA automation from
 Commands are published **non-retained** — they're one-shot actions, so HA won't
 replay the last one on restart.
 
+**Every input source publishes these same topics.** The USB knob and the Sense
+HAT joystick are interchangeable front-ends for the same three commands, so
+swapping hardware never requires an HA change. The one HA automation handles
+whatever is plugged in.
+
+If the automation ever seems dead, check the topic names first: they were
+renamed from `sensehat/lights/set` to `sensehat/bedroom/...` when this was
+retargeted from "all lights" to the bedroom. An HA automation still listening
+on the old topic will simply never fire.
+
 ### USB volume knob
 
 Read straight from `/dev/input/eventN` by parsing `input_event` structs — no
@@ -167,12 +177,76 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
 
 ## Status
 
+Done:
+
 - [x] MQTT broker set up in HA (Mosquitto add-on, login `pi_sensehat`)
-- [x] I2C enabled + packages installed + service running on boot
-- [x] Joystick orientation calibrated across all four orientations
+- [x] I2C enabled, packages installed, service runs on boot
+- [x] Sense HAT joystick orientation calibrated across all four orientations
 - [x] USB volume knob supported (auto-detected, debounced, hot-plug tolerant)
 - [x] Sense HAT made optional — refit it and it is picked up automatically
 - [x] Targets confirmed: "Bedroom" area + `cover.bedroom_blinds`
-- [ ] Updated `ha-automation.yaml` pasted into HA (replaces the old
-      "Sense HAT joystick lights" automation — delete that one)
-- [ ] Knob tested end-to-end against HA
+
+Outstanding:
+
+- [ ] **In HA:** make sure the automation from `ha-automation.yaml` is the live
+      one, and the older "Sense HAT joystick lights" automation is deleted.
+      This is left over from the bedroom retarget — *not* from the knob swap;
+      the knob needs no HA change. If the bedroom automation is already pasted
+      in, there is nothing to do here.
+- [ ] End-to-end test: press mute (lights) and turn the knob (blinds).
+
+### Testing end to end
+
+Watch the Pi while using the knob:
+
+```bash
+journalctl -u sensehat-ha -f
+```
+
+Each input logs a line like `action: blinds_open`. That splits the problem
+cleanly in two:
+
+- **No log line** → the Pi isn't seeing the input (knob/device problem).
+- **Log line but nothing happens** → the Pi sent it fine; the issue is on the
+  HA side (automation missing, wrong topic, or wrong entity/area).
+
+To test HA without touching the hardware, publish a command by hand:
+
+```bash
+python3 -c "import paho.mqtt.client as m,time; c=m.Client(m.CallbackAPIVersion.VERSION2); c.username_pw_set('pi_sensehat','pi3'); c.connect('192.168.1.221',1883); c.loop_start(); c.publish('sensehat/bedroom/blinds/set','open'); time.sleep(1)"
+```
+
+---
+
+## History — what was built, and why
+
+Roughly in order, so the odd-looking decisions have context:
+
+1. **Sensors → HA over MQTT.** Chose MQTT discovery over the REST API so the
+   entities create themselves and survive HA restarts.
+2. **Mosquitto** had to be installed first — a network scan found HA on
+   `192.168.1.221` but no broker anywhere. The login lives in the add-on's own
+   **Logins** list (an HA *user* account also works, but wasn't what we used).
+3. **LED matrix dashboard** (light + temp/humidity/pressure bars) was built,
+   then later **scrapped**; the matrix is now off. Kept in git history and
+   `sensehat_ha.py.matrix-version.bak`.
+   - Learned along the way: the matrix is **5-bit per channel** with a gamma
+     curve that crushes dim values, so colours can be dim *or* pastel, not
+     both. Dim colours must stay saturated or they all render grey.
+4. **Joystick orientation** was calibrated on-device. Several wrong guesses
+   (mirrored axes) were resolved by logging raw events in all four
+   orientations; the real fix was rotating by the **inverse** of the display
+   rotation (`-deg`), not a reflection.
+5. **Retargeted** from "all lights + brightness/colour" to **bedroom lights +
+   blinds**, which renamed the MQTT topics. This is the only reason HA needs a
+   new automation.
+6. **Commands made non-retained.** Retained commands are wrong for one-shot
+   actions — HA would replay the last one on restart. (A stale retained message
+   on the old `sensehat/lights/set` topic was cleared.)
+7. **Sense HAT swapped for a USB volume knob.** The HAT's absence was
+   crash-looping the service, so the HAT became optional and the knob was added
+   as a second front-end publishing the same commands.
+   - Read via raw `input_event` structs rather than `evdev`, so there is no
+     package to install (there is no passwordless sudo on this box).
+   - Debounced, because one knob detent = one key event; a quick spin would
+     otherwise fire a burst of identical commands at HA.
