@@ -1,0 +1,44 @@
+# Companion automation: report the blinds' state back to the Pi.
+#
+# How to add it:
+#   Settings -> Automations & Scenes -> Automations -> Create Automation
+#   -> (three-dot menu, top right) -> "Edit in YAML" -> paste this -> Save.
+#
+# This is a SECOND automation, alongside the one in ha-automation.yaml. Create
+# it as its own automation; don't paste it into the same editor.
+#
+# WHY IT EXISTS
+# The Pi refuses a new open/close while the blinds are already moving, and turns
+# an opposite-direction command into a "stop" instead. To do that it has to know
+# whether the blinds are moving. This automation tells it, by mirroring the
+# cover's state onto:
+#
+#   sensehat/bedroom/blinds/state  -> "opening" | "closing" | "open" | "closed"
+#
+# Retained, so the Pi picks up the current state as soon as it connects.
+#
+# OPTIONAL. Without it the Pi falls back to a timer (BLINDS_TRAVEL_TIME in
+# config.env) and assumes a move takes that long. With it, the interlock
+# releases the moment the blinds actually arrive.
+#
+# NOTE: some covers never report "opening"/"closing", only "open"/"closed". The
+# Pi handles that — it ignores terminal states from a cover it has never seen
+# report travel, and relies on the timer instead.
+
+alias: Bedroom blinds state -> Pi
+description: Mirrors cover.bedroom_blinds state to MQTT so the Pi's interlock knows when a move ends.
+mode: queued
+max: 10
+triggers:
+  - trigger: state
+    entity_id: cover.bedroom_blinds
+conditions:
+  # Ignore attribute-only changes (e.g. position ticking during travel).
+  - condition: template
+    value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+actions:
+  - action: mqtt.publish
+    data:
+      topic: sensehat/bedroom/blinds/state
+      payload: "{{ trigger.to_state.state }}"
+      retain: true

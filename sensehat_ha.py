@@ -9,6 +9,10 @@ Two input sources, either or both may be present:
   volume down -> blinds open      down  -> blinds close
   mute press  -> lights toggle    click -> lights toggle
 
+Blinds moves are interlocked: while the blinds are travelling, turning the
+control the *opposite* way stops them where they are, and a command the same
+way is ignored. See BLINDS below.
+
 Also publishes the Sense HAT's temperature/humidity/pressure to HA via MQTT
 discovery, when the HAT is attached.
 
@@ -70,6 +74,19 @@ TEMP_OFFSET = float(_env("TEMP_OFFSET", "0"))   # calibrate temp (CPU heats Pi)
 # are dropped instead of spamming Home Assistant.
 ACTION_DEBOUNCE = float(_env("ACTION_DEBOUNCE", "0.4"))
 
+# --- blinds interlock ---
+# How long a full open/close takes, seconds. Used as the fallback "still
+# moving" window when Home Assistant isn't reporting the cover's state (or is
+# reporting it late), so the interlock can never latch on forever.
+BLINDS_TRAVEL_TIME = float(_env("BLINDS_TRAVEL_TIME", "30"))
+# After a stop, ignore open/close for this long, so the same flick of the knob
+# that stopped the blinds can't immediately start them again.
+BLINDS_STOP_LOCKOUT = float(_env("BLINDS_STOP_LOCKOUT", "1.0"))
+# Optional feedback topic: HA publishes the cover's state here (opening /
+# closing / open / closed / stopped) so the Pi knows exactly when a move ends
+# rather than guessing from BLINDS_TRAVEL_TIME. Blank disables the feedback.
+BLINDS_STATE_TOPIC = _env("BLINDS_STATE_TOPIC", "sensehat/bedroom/blinds/state")
+
 # --- USB volume knob ---
 ENABLE_KNOB = _flag("ENABLE_KNOB", "true")
 # Explicit input device path; leave blank to auto-detect by name.
@@ -97,6 +114,89 @@ import paho.mqtt.client as mqtt  # noqa: E402
 _last_action = {}
 
 
+# What the blinds are believed to be doing, so a second command can be turned
+# into a stop instead of a queued reversal. "until" is a safety deadline: if HA
+# never tells us the move finished, we assume it has after BLINDS_TRAVEL_TIME.
+_blinds = {
+    "moving": None,          # "open" | "close" | None (idle)
+    "until": 0.0,            # monotonic time the assumed travel ends
+    "lockout": 0.0,          # no open/close accepted before this time
+    "reports_travel": False,  # has HA ever sent us "opening"/"closing"?
+}
+
+
+# Direction -> present participle, for readable log lines.
+_TRAVELLING = {"open": "opening", "close": "closing"}
+
+
+def blinds_moving():
+    """Direction currently being travelled, or None. Expires on its deadline."""
+    if _blinds["moving"] is not None and time.monotonic() >= _blinds["until"]:
+        _blinds["moving"] = None
+    return _blinds["moving"]
+
+
+def request_blinds(direction, client):
+    """Apply the interlock, then publish open/close/stop as appropriate.
+
+    While the blinds are moving:
+      - the opposite direction stops them where they are;
+      - the same direction is ignored (they are already going that way).
+    Otherwise the move is only started once any post-stop lockout has passed.
+    """
+    now = time.monotonic()
+    moving = blinds_moving()
+
+    if moving:
+        if direction == moving:
+            print(f"blinds: already {_TRAVELLING[moving]} — ignored", flush=True)
+            return
+        client.publish(BLINDS_TOPIC, "stop", retain=False)
+        _blinds["moving"] = None
+        _blinds["lockout"] = now + BLINDS_STOP_LOCKOUT
+        print("action: blinds_stop", flush=True)
+        return
+
+    if now < _blinds["lockout"]:
+        print("blinds: settling after stop — ignored", flush=True)
+        return
+
+    client.publish(BLINDS_TOPIC, direction, retain=False)
+    _blinds["moving"] = direction
+    _blinds["until"] = now + BLINDS_TRAVEL_TIME
+    print(f"action: blinds_{direction}", flush=True)
+
+
+def on_blinds_state(client, userdata, msg):
+    """Track the real cover state, when HA is publishing it."""
+    try:
+        payload = msg.payload.decode("utf-8", "replace").strip().lower()
+    except Exception:
+        return
+    before = _blinds["moving"]
+    if payload in ("opening", "closing"):
+        # The cover reports travel, so its terminal states are trustworthy too.
+        _blinds["reports_travel"] = True
+        _blinds["moving"] = "open" if payload == "opening" else "close"
+        _blinds["until"] = time.monotonic() + BLINDS_TRAVEL_TIME
+    elif payload in ("open", "closed", "stopped"):
+        # Only believe "it has arrived" from a cover that reports travel at
+        # all; one that only ever says open/closed would clear the interlock
+        # the instant a move started.
+        if _blinds["reports_travel"]:
+            _blinds["moving"] = None
+    else:
+        return
+    # Log only transitions, so a retained republish doesn't spam the journal.
+    # Without this the interlock's view of the world is invisible, which is
+    # exactly what made the queued-stop bug so hard to pin down.
+    if _blinds["moving"] != before:
+        now_moving = _blinds["moving"]
+        print(f"blinds: HA says {payload!r} -> interlock "
+              f"{'armed (' + now_moving + ')' if now_moving else 'released'}",
+              flush=True)
+
+
 def do_action(name, client):
     """Publish one command, debounced per action."""
     now = time.monotonic()
@@ -105,13 +205,11 @@ def do_action(name, client):
     _last_action[name] = now
     if name == "lights_toggle":
         client.publish(LIGHTS_TOPIC, "toggle", retain=False)
+        print(f"action: {name}", flush=True)
     elif name == "blinds_open":
-        client.publish(BLINDS_TOPIC, "open", retain=False)
+        request_blinds("open", client)     # interlocked; logs its own outcome
     elif name == "blinds_close":
-        client.publish(BLINDS_TOPIC, "close", retain=False)
-    else:
-        return
-    print(f"action: {name}", flush=True)
+        request_blinds("close", client)
 
 
 # --- USB volume knob ---------------------------------------------------------
@@ -350,6 +448,9 @@ def _stop(*_):
 def on_connect(client, userdata, flags, reason_code, properties=None):
     print(f"MQTT connected: {reason_code}", flush=True)
     publish_discovery(client)
+    if BLINDS_STATE_TOPIC:
+        # Re-subscribed on every (re)connect, since a reconnect drops these.
+        client.subscribe(BLINDS_STATE_TOPIC)
 
 
 def main():
@@ -373,6 +474,8 @@ def main():
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.on_connect = on_connect
+    if BLINDS_STATE_TOPIC:
+        client.message_callback_add(BLINDS_STATE_TOPIC, on_blinds_state)
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
 

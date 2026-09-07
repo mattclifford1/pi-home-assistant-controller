@@ -4,7 +4,11 @@
 #   Settings -> Automations & Scenes -> Automations -> Create Automation
 #   -> (three-dot menu, top right) -> "Edit in YAML" -> paste this -> Save.
 #
-# Replaces the older "Sense HAT joystick lights" automation — delete that one.
+# Renamed to "Bedroom controls (Pi)" on 2026-09-07. It was live as "Sense HAT
+# bedroom controls" (and before that "Sense HAT joystick lights") — legacy names
+# from when the HAT was the only input device. If you are looking at an HA that
+# still shows an old name, it is the same automation; rename it rather than
+# creating a second one.
 #
 # This one automation serves BOTH input devices — the USB volume knob and the
 # Sense HAT joystick publish the same commands, so swapping the hardware needs
@@ -12,7 +16,12 @@
 #
 # The Pi publishes plain-text commands when a control is used:
 #   sensehat/bedroom/lights/set  -> "toggle"
-#   sensehat/bedroom/blinds/set  -> "open" | "close"
+#   sensehat/bedroom/blinds/set  -> "open" | "close" | "stop"
+#
+# "stop" is sent when a control is turned the opposite way while the blinds are
+# moving — see "Blinds interlock" in the README. Also add the companion
+# automation in ha-automation-blinds-state.yaml, which reports the cover's state
+# back to the Pi so it knows when a move has actually finished.
 #
 # TARGETING:
 #   lights -> the "Bedroom" area (area_id: bedroom), i.e. every light in it.
@@ -23,8 +32,14 @@
 # cover in the Bedroom area instead, swap the entity_id for `area_id: bedroom`.
 
 alias: Bedroom controls (Pi)
-description: Knob/joystick toggles bedroom lights and opens/closes the blinds.
-mode: queued
+description: Knob/joystick toggles bedroom lights; opens/closes/stops the blinds.
+# MUST be parallel, not queued. The Tuiss integration's open_cover/close_cover
+# block for the WHOLE travel (~40s) rather than returning once the command is
+# sent. Under `mode: queued` a stop sits behind the still-running open/close and
+# only fires after the move it was supposed to interrupt has finished — which is
+# exactly the bug this file's stop branch was added to fix. Parallel lets the
+# stop run alongside the blocked move, which is the only way it lands in time.
+mode: parallel
 max: 10
 triggers:
   - trigger: mqtt
@@ -64,5 +79,16 @@ actions:
             value_template: "{{ trigger.payload == 'close' }}"
         sequence:
           - action: cover.close_cover
+            target:
+              entity_id: cover.bedroom_blinds
+
+      # --- opposite way while moving -> stop the blinds where they are ---
+      - conditions:
+          - condition: trigger
+            id: blinds
+          - condition: template
+            value_template: "{{ trigger.payload == 'stop' }}"
+        sequence:
+          - action: cover.stop_cover
             target:
               entity_id: cover.bedroom_blinds
