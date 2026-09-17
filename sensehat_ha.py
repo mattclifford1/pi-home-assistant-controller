@@ -79,9 +79,18 @@ ACTION_DEBOUNCE = float(_env("ACTION_DEBOUNCE", "0.4"))
 # moving" window when Home Assistant isn't reporting the cover's state (or is
 # reporting it late), so the interlock can never latch on forever.
 BLINDS_TRAVEL_TIME = float(_env("BLINDS_TRAVEL_TIME", "30"))
-# After a stop, ignore open/close for this long, so the same flick of the knob
-# that stopped the blinds can't immediately start them again.
+# After a stop, ignore open/close until the control has been quiet for this
+# long, so the rest of the knob spin that stopped the blinds can't restart them.
 BLINDS_STOP_LOCKOUT = float(_env("BLINDS_STOP_LOCKOUT", "1.0"))
+# Once HA has shown it reports travel, a move it hasn't confirmed with
+# "opening"/"closing" within this many seconds is assumed not to have happened
+# (e.g. "open" on blinds already fully open), and the interlock is released.
+BLINDS_CONFIRM_TIME = float(_env("BLINDS_CONFIRM_TIME", "6"))
+# HA takes a second or two to finish a stop, and rejects any open/close that
+# arrives before then. A turn made in that window is held and sent the moment
+# HA reports the blinds have stopped — or after this many seconds if it never
+# does — instead of being lost.
+BLINDS_STOP_SETTLE = float(_env("BLINDS_STOP_SETTLE", "5"))
 # Optional feedback topic: HA publishes the cover's state here (opening /
 # closing / open / closed / stopped) so the Pi knows exactly when a move ends
 # rather than guessing from BLINDS_TRAVEL_TIME. Blank disables the feedback.
@@ -122,6 +131,10 @@ _blinds = {
     "until": 0.0,            # monotonic time the assumed travel ends
     "lockout": 0.0,          # no open/close accepted before this time
     "reports_travel": False,  # has HA ever sent us "opening"/"closing"?
+    "confirmed": False,      # has HA confirmed the current move is travelling?
+    "confirm_by": 0.0,       # monotonic time HA must have confirmed it by
+    "stop_settle": 0.0,      # waiting for HA to finish a stop until this time
+    "queued": None,          # "open" | "close" to send once the stop is done
 }
 
 
@@ -131,7 +144,16 @@ _TRAVELLING = {"open": "opening", "close": "closing"}
 
 def blinds_moving():
     """Direction currently being travelled, or None. Expires on its deadline."""
-    if _blinds["moving"] is not None and time.monotonic() >= _blinds["until"]:
+    now = time.monotonic()
+    if _blinds["moving"] is not None and now >= _blinds["until"]:
+        _blinds["moving"] = None
+    if (_blinds["moving"] is not None and _blinds["reports_travel"]
+            and not _blinds["confirmed"] and now >= _blinds["confirm_by"]):
+        # Without this, a command that moved nothing (blinds already there)
+        # armed the interlock for the full travel time, so the next turn the
+        # other way sent "stop" instead of moving them.
+        print("blinds: HA never reported travel -> interlock released",
+              flush=True)
         _blinds["moving"] = None
     return _blinds["moving"]
 
@@ -154,17 +176,50 @@ def request_blinds(direction, client):
         client.publish(BLINDS_TOPIC, "stop", retain=False)
         _blinds["moving"] = None
         _blinds["lockout"] = now + BLINDS_STOP_LOCKOUT
+        if _blinds["reports_travel"]:
+            _blinds["stop_settle"] = now + BLINDS_STOP_SETTLE
+        _blinds["queued"] = None
         print("action: blinds_stop", flush=True)
         return
 
     if now < _blinds["lockout"]:
+        # Extend while the knob keeps turning: a long spin outlasts a fixed
+        # lockout, and its tail would otherwise start the blinds again.
+        _blinds["lockout"] = now + BLINDS_STOP_LOCKOUT
         print("blinds: settling after stop — ignored", flush=True)
         return
 
+    if now < _blinds["stop_settle"]:
+        _blinds["queued"] = direction
+        print(f"blinds: HA still stopping — will {direction} when it's done",
+              flush=True)
+        return
+
+    start_blinds(direction, client, now)
+
+
+def start_blinds(direction, client, now):
     client.publish(BLINDS_TOPIC, direction, retain=False)
     _blinds["moving"] = direction
     _blinds["until"] = now + BLINDS_TRAVEL_TIME
+    _blinds["confirmed"] = False
+    _blinds["confirm_by"] = now + BLINDS_CONFIRM_TIME
     print(f"action: blinds_{direction}", flush=True)
+
+
+def tick_blinds(client):
+    """Send a move held back while HA finished a stop. Call regularly."""
+    if _blinds["queued"] is None:
+        return
+    now = time.monotonic()
+    if now < _blinds["stop_settle"]:
+        return
+    direction, _blinds["queued"] = _blinds["queued"], None
+    if blinds_moving():
+        # Something else (the app, a schedule) started the blinds meanwhile.
+        print(f"blinds: queued {direction} dropped — blinds moving", flush=True)
+        return
+    start_blinds(direction, client, now)
 
 
 def on_blinds_state(client, userdata, msg):
@@ -177,6 +232,7 @@ def on_blinds_state(client, userdata, msg):
     if payload in ("opening", "closing"):
         # The cover reports travel, so its terminal states are trustworthy too.
         _blinds["reports_travel"] = True
+        _blinds["confirmed"] = True
         _blinds["moving"] = "open" if payload == "opening" else "close"
         _blinds["until"] = time.monotonic() + BLINDS_TRAVEL_TIME
     elif payload in ("open", "closed", "stopped"):
@@ -185,16 +241,17 @@ def on_blinds_state(client, userdata, msg):
         # the instant a move started.
         if _blinds["reports_travel"]:
             _blinds["moving"] = None
+            # The stop has landed; HA will now accept a new move.
+            _blinds["stop_settle"] = 0.0
     else:
         return
-    # Log only transitions, so a retained republish doesn't spam the journal.
-    # Without this the interlock's view of the world is invisible, which is
-    # exactly what made the queued-stop bug so hard to pin down.
-    if _blinds["moving"] != before:
-        now_moving = _blinds["moving"]
-        print(f"blinds: HA says {payload!r} -> interlock "
-              f"{'armed (' + now_moving + ')' if now_moving else 'released'}",
-              flush=True)
+    # Log every report, not just interlock transitions: whether HA confirmed a
+    # move the Pi asked for is the first thing to check when the blinds don't
+    # respond. HA only publishes on state changes, so this stays quiet.
+    now_moving = _blinds["moving"]
+    change = (f"interlock {'armed (' + now_moving + ')' if now_moving else 'released'}"
+              if now_moving != before else "interlock unchanged")
+    print(f"blinds: HA says {payload!r} -> {change}", flush=True)
 
 
 def do_action(name, client):
@@ -484,6 +541,7 @@ def main():
     try:
         while _running:
             knob.poll(client)
+            tick_blinds(client)
             if sense:
                 for event in sense.stick.get_events():
                     handle_stick(event, client)

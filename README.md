@@ -169,7 +169,8 @@ wanted, and irritating. So the Pi refuses to queue a reversal:
 |-------------------------|-----------------------|----------------------------------|
 | moving                  | the **opposite** way  | **stop** where they are          |
 | moving                  | the **same** way      | ignored (already going that way) |
-| stopped, < 1s ago       | either way            | ignored (settling)               |
+| stopped, knob still turning (< 1s) | either way | ignored (settling)          |
+| stopped, HA still finishing the stop | either way | held, sent once HA is done   |
 | idle                    | either way            | the move starts                  |
 
 Rules, in `request_blinds()`:
@@ -177,13 +178,23 @@ Rules, in `request_blinds()`:
 1. **Only a stop interrupts a move.** An open/close arriving mid-travel is
    either turned into `stop` (opposite direction) or dropped (same direction);
    it is never queued.
-2. **After a stop, a 1s lockout** (`BLINDS_STOP_LOCKOUT`) ignores open/close, so
-   the tail of the same knob spin that stopped the blinds doesn't start them
-   off again. Keep spinning past that second and it will start the new move —
-   which is the intended way to reverse deliberately.
-3. This applies to **both input devices**; the joystick goes through the same
+2. **After a stop, open/close is ignored until the control has been still for
+   1s** (`BLINDS_STOP_LOCKOUT`), so the tail of the same knob spin that stopped
+   the blinds doesn't start them off again. The lockout restarts on every
+   ignored detent, because one spin of the knob lasts 2-3s and used to outlast
+   a fixed 1s window.
+3. **A turn made while HA is still finishing a stop is held, not lost.** HA
+   rejects open/close until its stop completes (a second or two), so the Pi
+   keeps the last direction turned and sends it the moment HA reports the
+   blinds stopped, or after `BLINDS_STOP_SETTLE` (5s) if HA never says.
+4. **A move HA never confirms is forgotten.** Once HA has shown it reports
+   travel, an open/close it doesn't confirm with `opening`/`closing` within
+   `BLINDS_CONFIRM_TIME` (6s) is assumed to have moved nothing (e.g. "open" on
+   blinds already fully open). Without this, the next turn the other way sent
+   `stop` instead of moving them.
+5. This applies to **both input devices**; the joystick goes through the same
    gate.
-4. **Lights are unaffected** — the mute press/click works whatever the blinds
+6. **Lights are unaffected** — the mute press/click works whatever the blinds
    are doing.
 
 #### Why the HA automation must be `mode: parallel`
@@ -193,6 +204,24 @@ The Tuiss cover's open/close service calls **block for the whole travel**. Under
 interrupt, so it always arrives too late. `mode: parallel` lets it run
 alongside. This is not optional — with `queued`, everything above works and the
 blinds still won't stop.
+
+#### Tuiss2HA 1.16.0 needs a patch
+
+Tuiss2HA 1.16.0 (released 13 Sep 2026) broke stop. The blinds stop, but the
+integration keeps treating the move as running until its timeout (about a
+minute). Until then the cover shows `opening`/`closing`, every open/close is
+rejected as "device locked", and the timeout then reports the blinds at their
+target (e.g. `closed` when they stopped part-way).
+
+HA here runs a patched `/config/custom_components/tuiss2ha/hub.py`, where the
+stop itself ends the move. The fix and its tests are in `~/tuiss2ha-fix/` on the
+Pi (branch `fix/stop-releases-move`, pushed to
+[mattclifford1/Tuiss2HA](https://github.com/mattclifford1/Tuiss2HA)) and have
+been submitted upstream to
+[pink88/Tuiss2HA](https://github.com/pink88/Tuiss2HA). **A HACS update or
+redownload overwrites the patch**: until a release includes the fix, re-apply
+the patched `hub.py` after any update, or stop-then-move will lock up for a
+minute again.
 
 #### Knowing when a move has finished
 
@@ -257,8 +286,9 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
 
 - **Change publish rate / temperature offset / topics:** edit `config.env`,
   then `sudo systemctl restart sensehat-ha`.
-- **Blinds stopping/locking out wrongly:** tune `BLINDS_TRAVEL_TIME` and
-  `BLINDS_STOP_LOCKOUT` in `config.env` — see
+- **Blinds stopping/locking out wrongly:** tune `BLINDS_TRAVEL_TIME`,
+  `BLINDS_STOP_LOCKOUT`, `BLINDS_CONFIRM_TIME` and `BLINDS_STOP_SETTLE` in
+  `config.env` — see
   [Blinds interlock](#blinds-interlock).
 - **Target different lights/blinds:** edit `ha-automation.yaml` — it targets the
   HA **`bedroom` area**; swap `area_id: bedroom` for explicit `entity_id:`s if
@@ -364,8 +394,15 @@ The interlock logs its decisions too, so you can see why nothing happened:
 action: blinds_close                     <- move started
 blinds: already closing — ignored        <- same way again, dropped
 action: blinds_stop                      <- opposite way, stopped it
-blinds: settling after stop — ignored    <- inside the 1s lockout
+blinds: settling after stop — ignored    <- knob still turning after the stop
+blinds: HA still stopping — will open when it's done   <- held
+blinds: HA says 'open' -> interlock released           <- stop done; held move sent
+blinds: HA never reported travel -> interlock released <- command moved nothing
 ```
+
+Every state report from HA is logged too (`blinds: HA says ...`), so you can
+see whether HA acted on a command. If the Pi logs `action: blinds_open` but no
+`HA says 'opening'` follows, the problem is on the HA side.
 
 To test HA without touching the hardware, publish a command by hand:
 
@@ -422,3 +459,26 @@ Roughly in order, so the odd-looking decisions have context:
      report `opening`/`closing` at least once — covers that only report
      `open`/`closed` would otherwise clear the interlock the moment a move
      started, reintroducing the original bug.
+9. **Knob debugging, Sept 2026.** The knob "stopped working for the blinds"
+   while the joystick seemed fine. It had four separate causes, found in turn:
+   - **Wi-Fi.** The Pi was bouncing between access points with power saving
+     on, and dropped about 300 times in a day, silently losing commands. It
+     settled once it joined the strongest access point. If commands go missing
+     again, check `journalctl -u wpa_supplicant` for `CTRL-EVENT-DISCONNECTED`
+     first.
+   - **Moves that moved nothing armed the interlock**, so the next turn back
+     sent `stop` instead of moving (now `BLINDS_CONFIRM_TIME`). A knob spin also
+     outlasted the fixed 1s lockout and restarted the blinds (the lockout now
+     extends while the knob turns). A short-lived "already closed — ignored"
+     check was removed again: after a stop, HA can say `closed` for blinds that
+     stopped part-way.
+   - **Tuiss2HA 1.16.0 broke stop** (see
+     [above](#tuiss2ha-1160-needs-a-patch)). This was why nothing worked after
+     a stop, and it looked like a Pi problem. A Pi-side "re-send stop until HA
+     confirms" change was tried and removed, because HA's state, not the stop,
+     was wrong.
+   - **HA rejects moves until a stop finishes**, even with the patch, so turns
+     in that second or two are now held and sent once it's done
+     (`BLINDS_STOP_SETTLE`).
+   The joystick went through all the same code; it just rarely hit these
+   because one press is one event.
