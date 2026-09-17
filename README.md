@@ -35,6 +35,9 @@ opposite way **stops them where they are** instead of reversing them. See
 - **Sense HAT** (**v1** — no light/colour sensor; other onboard sensors are the
   IMU: accel/gyro/magnetometer). Currently **detached**.
 - Pi IP: `192.168.1.64`
+- **Wi-Fi power saving is turned off** on `wlan0` (see
+  [Wi-Fi power saving](#wi-fi-power-saving)) — the default on Raspberry Pi OS
+  is on, and it was losing commands.
 - Home Assistant: `http://192.168.1.221:8123`
 - MQTT broker: Mosquitto add-on on the HA box, `192.168.1.221:1883`,
   login `pi_sensehat` (defined in the add-on's own **Logins**, not an HA user).
@@ -317,11 +320,56 @@ Calibration knobs in `config.env`: `AUTO_ORIENT`, `DEFAULT_ROTATION`,
   - Don't judge a blocking service call as "broken". Measure it: a
     `close_cover` that returns in 11.2s returned *because* something stopped
     the blind at 11.2s.
+- **Wi-Fi power saving drops the connection.** The Pi 3's Wi-Fi dozes between
+  beacons by default; the access point decides the client has gone away and
+  disconnects it ("inactivity", `reason=4`). Commands published while
+  disconnected are lost silently, because they go out at QoS 0 and the service
+  only notices the broker has gone after its 60s keepalive. On 15 Sep 2026 this
+  happened ~300 times in a day. Turned off — see
+  [Wi-Fi power saving](#wi-fi-power-saving).
+- **A weak access point is worse than a distant one.** The Pi kept re-joining a
+  nearer access point that repeatedly kicked it off, falling back to one at
+  -85 dBm with 45% packet loss. It has been steady since it settled on a third
+  at about -50 dBm. `iw dev wlan0 link` shows which one and how strong.
 - **The Tuiss cover's `state` doesn't track `current_position` sensibly** once
   stopped part-way: stopped at 82% it reported `open`, stopped at 18% it
   reported `closed`. Don't infer position from the state string — read
   `current_position`. The interlock is unaffected, since it treats `open`,
   `closed` and `stopped` alike as "not moving".
+
+### Wi-Fi power saving
+
+Raspberry Pi OS leaves Wi-Fi power saving **on** by default (NetworkManager's
+`802-11-wireless.powersave` is `0 (default)`, which defers to the `brcmfmac`
+driver, and the driver enables it). On this Pi it was disabled on 17 Sep 2026,
+after it caused ~300 disconnections in a day and silently lost blinds commands:
+
+```bash
+sudo nmcli connection modify netplan-wlan0-EE-9XKP29 802-11-wireless.powersave 2
+sudo nmcli connection up netplan-wlan0-EE-9XKP29
+```
+
+The second command reconnects, so SSH sessions stall for a few seconds. Check
+it took effect (expect `2 (disable)` and `Power save: off`):
+
+```bash
+nmcli -f 802-11-wireless.powersave connection show netplan-wlan0-EE-9XKP29
+iw dev wlan0 get power_save
+```
+
+**To change back**, set it to `0` (the Pi default) and reconnect:
+
+```bash
+sudo nmcli connection modify netplan-wlan0-EE-9XKP29 802-11-wireless.powersave 0
+sudo nmcli connection up netplan-wlan0-EE-9XKP29
+```
+
+Values are `0` default, `1` leave alone, `2` off, `3` on. The setting lives in
+the NetworkManager connection, which survives reboots — but the connection is
+generated from **netplan** (`netplan-wlan0-EE-9XKP29`), so if netplan ever
+regenerates it the setting is lost and has to be re-applied, or moved into the
+netplan config itself. `journalctl -u wpa_supplicant | grep DISCONNECTED` is
+the quickest way to spot it coming back.
 
 ---
 
